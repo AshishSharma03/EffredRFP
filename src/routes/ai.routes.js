@@ -1,159 +1,322 @@
 import express from 'express';
+import { GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { asyncHandler, AppError } from '../middleware/error.middleware.js';
-import { authenticate } from '../middleware/auth.middleware.js';
-import { aiService } from '../services/ai.service.js';
-import { searchService } from '../services/search.service.js';
-import { proposalService } from '../services/proposal.service.js';
+import { authenticate, checkLimit } from '../middleware/auth.middleware.js';
+import { docClient, TABLES } from '../config/aws.config.js';
+import { generateAnswer, improveAnswer, generateSummary, searchKnowledgeBase } from '../services/ai.service.js';
 
 const router = express.Router();
 
+// Apply authentication to all routes
+router.use(authenticate);
+
+/**
+ * @route   POST /api/v1/ai/generate-answer
+ * @desc    Generate draft answer for a question
+ * @access  Private
+ */
 router.post(
   '/generate-answer',
-  authenticate,
+  checkLimit('searches'),
   asyncHandler(async (req, res) => {
     const { proposalId, questionId, question } = req.body;
 
     if (!proposalId || !questionId || !question) {
-      throw new AppError('Proposal ID, question ID, and question text are required', 400);
+      throw new AppError('proposalId, questionId, and question are required', 400);
     }
 
-    const proposal = await proposalService.getProposal(proposalId);
-    if (!proposal || proposal.userId !== req.user.id) {
-      throw new AppError('Proposal not found or unauthorized', 403);
+    // Get proposal
+    const proposalResponse = await docClient.send(
+      new GetCommand({
+        TableName: TABLES.PROPOSALS,
+        Key: { id: proposalId },
+      })
+    );
+
+    if (!proposalResponse.Item) {
+      throw new AppError('Proposal not found', 404);
     }
 
-    const relevantContext = await searchService.searchRelevantContext(question, 5);
-    const draftAnswer = await aiService.generateDraftAnswer(question, relevantContext);
+    const proposal = proposalResponse.Item;
 
-    const updatedQuestions = proposal.questions.map(q => {
-      if (q.id === questionId) {
-        return {
-          ...q,
-          draftAnswer: draftAnswer.answer,
-          confidence: draftAnswer.confidence,
-          sources: draftAnswer.sources,
-          status: 'drafted',
-        };
-      }
-      return q;
-    });
+    // Check access
+    if (proposal.companyId !== req.user.companyId && req.user.role !== 'superadmin') {
+      throw new AppError('Access denied', 403);
+    }
 
-    await proposalService.updateProposal(proposalId, {
-      questions: updatedQuestions,
-    });
+    // Search knowledge base (simplified - you can enhance this)
+    const context = ''; // TODO: Implement knowledge base search
 
-    res.status(200).json({
-      message: 'Draft answer generated successfully',
-      answer: draftAnswer.answer,
-      confidence: draftAnswer.confidence,
-      sources: draftAnswer.sources,
+    // Generate answer
+    const result = await generateAnswer(question, context);
+
+    // Update question with draft answer
+    const questions = proposal.questions || [];
+    const questionIndex = questions.findIndex(q => q.id === questionId);
+
+    if (questionIndex !== -1) {
+      questions[questionIndex].draftAnswer = result.answer;
+      questions[questionIndex].confidence = result.confidence;
+      questions[questionIndex].sources = result.sources;
+      questions[questionIndex].status = 'draft';
+      questions[questionIndex].generatedAt = result.generatedAt;
+
+      await docClient.send(
+        new UpdateCommand({
+          TableName: TABLES.PROPOSALS,
+          Key: { id: proposalId },
+          UpdateExpression: 'SET questions = :questions, updatedAt = :updatedAt',
+          ExpressionAttributeValues: {
+            ':questions': questions,
+            ':updatedAt': new Date().toISOString(),
+          },
+        })
+      );
+    }
+
+    // Update search count
+    await docClient.send(
+      new UpdateCommand({
+        TableName: TABLES.COMPANIES,
+        Key: { id: req.user.companyId },
+        UpdateExpression: 'SET #limits.#searchesUsed = #limits.#searchesUsed + :inc',
+        ExpressionAttributeNames: {
+          '#limits': 'limits',
+          '#searchesUsed': 'searchesUsed',
+        },
+        ExpressionAttributeValues: {
+          ':inc': 1,
+        },
+      })
+    );
+
+    res.json({
+      message: 'Answer generated successfully',
+      ...result,
     });
   })
 );
 
+/**
+ * @route   POST /api/v1/ai/improve-answer
+ * @desc    Improve existing answer based on feedback
+ * @access  Private
+ */
 router.post(
   '/improve-answer',
-  authenticate,
+  checkLimit('searches'),
   asyncHandler(async (req, res) => {
     const { currentAnswer, feedback, question } = req.body;
 
     if (!currentAnswer || !feedback || !question) {
-      throw new AppError('Current answer, feedback, and question are required', 400);
+      throw new AppError('currentAnswer, feedback, and question are required', 400);
     }
 
-    const improvedAnswer = await aiService.improveDraftAnswer(
-      currentAnswer,
-      feedback,
-      question
+    // Generate improved answer
+    const improvedAnswer = await improveAnswer(currentAnswer, feedback, question);
+
+    // Update search count
+    await docClient.send(
+      new UpdateCommand({
+        TableName: TABLES.COMPANIES,
+        Key: { id: req.user.companyId },
+        UpdateExpression: 'SET #limits.#searchesUsed = #limits.#searchesUsed + :inc',
+        ExpressionAttributeNames: {
+          '#limits': 'limits',
+          '#searchesUsed': 'searchesUsed',
+        },
+        ExpressionAttributeValues: {
+          ':inc': 1,
+        },
+      })
     );
 
-    res.status(200).json({
+    res.json({
       message: 'Answer improved successfully',
       improvedAnswer,
+      improvedAt: new Date().toISOString(),
     });
   })
 );
 
+/**
+ * @route   POST /api/v1/ai/generate-summary
+ * @desc    Generate executive summary for proposal
+ * @access  Private
+ */
 router.post(
   '/generate-summary',
-  authenticate,
+  checkLimit('searches'),
   asyncHandler(async (req, res) => {
     const { proposalId } = req.body;
 
     if (!proposalId) {
-      throw new AppError('Proposal ID is required', 400);
+      throw new AppError('proposalId is required', 400);
     }
 
-    const proposal = await proposalService.getProposal(proposalId);
-    if (!proposal || proposal.userId !== req.user.id) {
-      throw new AppError('Proposal not found or unauthorized', 403);
+    // Get proposal
+    const proposalResponse = await docClient.send(
+      new GetCommand({
+        TableName: TABLES.PROPOSALS,
+        Key: { id: proposalId },
+      })
+    );
+
+    if (!proposalResponse.Item) {
+      throw new AppError('Proposal not found', 404);
     }
 
-    const sections = proposal.questions
-      .filter(q => q.finalAnswer || q.draftAnswer)
-      .map(q => ({
-        title: q.section,
-        content: q.finalAnswer || q.draftAnswer,
-      }));
+    const proposal = proposalResponse.Item;
 
-    const summary = await aiService.summarizeProposal(sections);
+    // Check access
+    if (proposal.companyId !== req.user.companyId && req.user.role !== 'superadmin') {
+      throw new AppError('Access denied', 403);
+    }
 
-    res.status(200).json({
-      message: 'Executive summary generated successfully',
+    // Generate summary
+    const summary = await generateSummary(proposal);
+
+    // Update proposal with summary
+    await docClient.send(
+      new UpdateCommand({
+        TableName: TABLES.PROPOSALS,
+        Key: { id: proposalId },
+        UpdateExpression: 'SET executiveSummary = :summary, updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':summary': summary,
+          ':updatedAt': new Date().toISOString(),
+        },
+      })
+    );
+
+    // Update search count
+    await docClient.send(
+      new UpdateCommand({
+        TableName: TABLES.COMPANIES,
+        Key: { id: req.user.companyId },
+        UpdateExpression: 'SET #limits.#searchesUsed = #limits.#searchesUsed + :inc',
+        ExpressionAttributeNames: {
+          '#limits': 'limits',
+          '#searchesUsed': 'searchesUsed',
+        },
+        ExpressionAttributeValues: {
+          ':inc': 1,
+        },
+      })
+    );
+
+    res.json({
+      message: 'Summary generated successfully',
       summary,
     });
   })
 );
 
+/**
+ * @route   POST /api/v1/ai/bulk-generate
+ * @desc    Generate answers for all pending questions
+ * @access  Private
+ */
 router.post(
   '/bulk-generate',
-  authenticate,
+  checkLimit('searches'),
   asyncHandler(async (req, res) => {
     const { proposalId } = req.body;
 
     if (!proposalId) {
-      throw new AppError('Proposal ID is required', 400);
+      throw new AppError('proposalId is required', 400);
     }
 
-    const proposal = await proposalService.getProposal(proposalId);
-    if (!proposal || proposal.userId !== req.user.id) {
-      throw new AppError('Proposal not found or unauthorized', 403);
+    // Get proposal
+    const proposalResponse = await docClient.send(
+      new GetCommand({
+        TableName: TABLES.PROPOSALS,
+        Key: { id: proposalId },
+      })
+    );
+
+    if (!proposalResponse.Item) {
+      throw new AppError('Proposal not found', 404);
     }
 
-    const pendingQuestions = proposal.questions.filter(q => q.status === 'pending');
-    let processedCount = 0;
+    const proposal = proposalResponse.Item;
+
+    // Check access
+    if (proposal.companyId !== req.user.companyId && req.user.role !== 'superadmin') {
+      throw new AppError('Access denied', 403);
+    }
+
+    const questions = proposal.questions || [];
+    const pendingQuestions = questions.filter(q => q.status === 'pending');
+
+    if (pendingQuestions.length === 0) {
+      throw new AppError('No pending questions found', 400);
+    }
+
+    // Generate answers for all pending questions
+    const results = [];
 
     for (const question of pendingQuestions) {
       try {
-        const relevantContext = await searchService.searchRelevantContext(
-          question.question,
-          5
-        );
+        const result = await generateAnswer(question.question, '');
         
-        const draftAnswer = await aiService.generateDraftAnswer(
-          question.question,
-          relevantContext
-        );
+        // Update question
+        const index = questions.findIndex(q => q.id === question.id);
+        if (index !== -1) {
+          questions[index].draftAnswer = result.answer;
+          questions[index].confidence = result.confidence;
+          questions[index].sources = result.sources;
+          questions[index].status = 'draft';
+          questions[index].generatedAt = result.generatedAt;
+        }
 
-        question.draftAnswer = draftAnswer.answer;
-        question.confidence = draftAnswer.confidence;
-        question.sources = draftAnswer.sources;
-        question.status = 'drafted';
-        
-        processedCount++;
+        results.push({
+          questionId: question.id,
+          success: true,
+        });
       } catch (error) {
-        console.error(`Failed to generate answer for question ${question.id}:`, error);
+        results.push({
+          questionId: question.id,
+          success: false,
+          error: error.message,
+        });
       }
     }
 
-    await proposalService.updateProposal(proposalId, {
-      questions: proposal.questions,
-    });
+    // Update proposal
+    await docClient.send(
+      new UpdateCommand({
+        TableName: TABLES.PROPOSALS,
+        Key: { id: proposalId },
+        UpdateExpression: 'SET questions = :questions, updatedAt = :updatedAt',
+        ExpressionAttributeValues: {
+          ':questions': questions,
+          ':updatedAt': new Date().toISOString(),
+        },
+      })
+    );
 
-    res.status(200).json({
-      message: 'Bulk generation completed',
-      totalQuestions: pendingQuestions.length,
-      processedCount,
+    // Update search count
+    await docClient.send(
+      new UpdateCommand({
+        TableName: TABLES.COMPANIES,
+        Key: { id: req.user.companyId },
+        UpdateExpression: 'SET #limits.#searchesUsed = #limits.#searchesUsed + :inc',
+        ExpressionAttributeNames: {
+          '#limits': 'limits',
+          '#searchesUsed': 'searchesUsed',
+        },
+        ExpressionAttributeValues: {
+          ':inc': pendingQuestions.length,
+        },
+      })
+    );
+
+    const successCount = results.filter(r => r.success).length;
+
+    res.json({
+      message: `Generated ${successCount}/${pendingQuestions.length} answers`,
+      results,
     });
   })
 );

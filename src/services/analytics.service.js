@@ -18,8 +18,8 @@ class AnalyticsService {
         knowledge,
         ai: aiStats,
         performance: {
-          averageResponseTime: 250,
-          successRate: 98.5,
+          averageResponseTime: 250, // ms (mock)
+          successRate: 98.5,        // %
           apiCalls: 15420,
         },
       };
@@ -40,25 +40,27 @@ class AnalyticsService {
         },
       });
 
-      const response = await docClient.send(command);
-      const proposals = response.Items || [];
+      const { Items = [] } = await docClient.send(command);
 
       const byStatus = {};
       const byMonth = {};
       let totalCompletionTime = 0;
       let completedCount = 0;
 
-      proposals.forEach((proposal) => {
-        byStatus[proposal.status] = (byStatus[proposal.status] || 0) + 1;
+      Items.forEach((proposal) => {
+        if (proposal.status) {
+          byStatus[proposal.status] = (byStatus[proposal.status] || 0) + 1;
+        }
 
-        const month = proposal.createdAt.substring(0, 7);
-        byMonth[month] = (byMonth[month] || 0) + 1;
+        if (proposal.createdAt) {
+          const month = proposal.createdAt.substring(0, 7);
+          byMonth[month] = (byMonth[month] || 0) + 1;
+        }
 
-        if (proposal.completedAt) {
+        if (proposal.completedAt && proposal.createdAt) {
           const created = new Date(proposal.createdAt).getTime();
           const completed = new Date(proposal.completedAt).getTime();
-          const hours = (completed - created) / (1000 * 60 * 60);
-          totalCompletionTime += hours;
+          totalCompletionTime += (completed - created) / (1000 * 60 * 60);
           completedCount++;
         }
       });
@@ -69,10 +71,11 @@ class AnalyticsService {
         .slice(-12);
 
       return {
-        total: proposals.length,
+        total: Items.length,
         byStatus,
         byMonth: byMonthArray,
-        averageCompletionTime: completedCount > 0 ? totalCompletionTime / completedCount : 0,
+        averageCompletionTime:
+          completedCount > 0 ? totalCompletionTime / completedCount : 0,
       };
     } catch (error) {
       logger.error('Error getting proposal stats:', error);
@@ -91,28 +94,28 @@ class AnalyticsService {
         },
       });
 
-      const response = await docClient.send(command);
-      const users = response.Items || [];
+      const { Items = [] } = await docClient.send(command);
 
       const byRole = {};
       const byDepartment = {};
-      let activeCount = 0;
+      let active = 0;
 
-      users.forEach((user) => {
-        byRole[user.role] = (byRole[user.role] || 0) + 1;
-        
+      Items.forEach((user) => {
+        if (user.role) {
+          byRole[user.role] = (byRole[user.role] || 0) + 1;
+        }
+
         if (user.department) {
-          byDepartment[user.department] = (byDepartment[user.department] || 0) + 1;
+          byDepartment[user.department] =
+            (byDepartment[user.department] || 0) + 1;
         }
-        
-        if (user.isActive) {
-          activeCount++;
-        }
+
+        if (user.isActive) active++;
       });
 
       return {
-        total: users.length,
-        active: activeCount,
+        total: Items.length,
+        active,
         byRole,
         byDepartment,
       };
@@ -133,19 +136,19 @@ class AnalyticsService {
         },
       });
 
-      const response = await docClient.send(command);
-      const documents = response.Items || [];
+      const { Items = [] } = await docClient.send(command);
 
       const byCategory = {};
       let totalSize = 0;
 
-      documents.forEach((doc) => {
-        byCategory[doc.category] = (byCategory[doc.category] || 0) + 1;
+      Items.forEach((doc) => {
+        const category = doc.category || 'Uncategorized';
+        byCategory[category] = (byCategory[category] || 0) + 1;
         totalSize += doc.size || 0;
       });
 
       return {
-        totalDocuments: documents.length,
+        totalDocuments: Items.length,
         byCategory,
         totalSize,
       };
@@ -157,7 +160,7 @@ class AnalyticsService {
 
   async getAIStats(companyId) {
     try {
-      const proposalsCommand = new QueryCommand({
+      const command = new QueryCommand({
         TableName: TABLES.PROPOSALS,
         IndexName: 'CompanyIdIndex',
         KeyConditionExpression: 'companyId = :companyId',
@@ -166,27 +169,25 @@ class AnalyticsService {
         },
       });
 
-      const proposalsResponse = await docClient.send(proposalsCommand);
-      const proposals = proposalsResponse.Items || [];
+      const { Items = [] } = await docClient.send(command);
 
       let totalGenerations = 0;
       let totalConfidence = 0;
       let confidenceCount = 0;
       const categoryCount = {};
 
-      proposals.forEach((proposal) => {
-        if (proposal.questions) {
-          proposal.questions.forEach((q) => {
-            if (q.draftAnswer) totalGenerations++;
-            if (q.confidence) {
-              totalConfidence += q.confidence;
-              confidenceCount++;
-            }
-            if (q.category) {
-              categoryCount[q.category] = (categoryCount[q.category] || 0) + 1;
-            }
-          });
-        }
+      Items.forEach((proposal) => {
+        (proposal.questions || []).forEach((q) => {
+          if (q.draftAnswer) totalGenerations++;
+          if (typeof q.confidence === 'number') {
+            totalConfidence += q.confidence;
+            confidenceCount++;
+          }
+          if (q.category) {
+            categoryCount[q.category] =
+              (categoryCount[q.category] || 0) + 1;
+          }
+        });
       });
 
       const topCategories = Object.entries(categoryCount)
@@ -196,7 +197,8 @@ class AnalyticsService {
 
       return {
         totalGenerations,
-        averageConfidence: confidenceCount > 0 ? totalConfidence / confidenceCount : 0,
+        averageConfidence:
+          confidenceCount > 0 ? totalConfidence / confidenceCount : 0,
         topCategories,
       };
     } catch (error) {
@@ -207,42 +209,36 @@ class AnalyticsService {
 
   async getDetailedProposalAnalytics(companyId, filters = {}) {
     try {
-      let filterExpression = '';
-      const expressionAttributeValues = {
-        ':companyId': companyId,
-      };
+      let filterExpression;
+      const values = { ':companyId': companyId };
+      const names = {};
 
       if (filters.status) {
         filterExpression = '#status = :status';
-        expressionAttributeValues[':status'] = filters.status;
+        values[':status'] = filters.status;
+        names['#status'] = 'status';
       }
 
       const command = new QueryCommand({
         TableName: TABLES.PROPOSALS,
         IndexName: 'CompanyIdIndex',
         KeyConditionExpression: 'companyId = :companyId',
-        FilterExpression: filterExpression || undefined,
-        ExpressionAttributeNames: filterExpression ? { '#status': 'status' } : undefined,
-        ExpressionAttributeValues: expressionAttributeValues,
+        FilterExpression: filterExpression,
+        ExpressionAttributeNames: Object.keys(names).length ? names : undefined,
+        ExpressionAttributeValues: values,
       });
 
-      const response = await docClient.send(command);
-      const proposals = response.Items || [];
+      const { Items = [] } = await docClient.send(command);
 
-      return proposals.map((proposal) => {
-        const questionCount = proposal.questions?.length || 0;
-        const approvedAnswers = proposal.questions?.filter(q => q.status === 'approved').length || 0;
-        const aiGeneratedAnswers = proposal.questions?.filter(q => q.draftAnswer).length || 0;
-        const humanEditedAnswers = proposal.questions?.filter(
-          q => q.finalAnswer && q.finalAnswer !== q.draftAnswer
-        ).length || 0;
+      return Items.map((proposal) => {
+        const questions = proposal.questions || [];
 
-        let completionTime;
-        if (proposal.completedAt) {
-          const created = new Date(proposal.createdAt).getTime();
-          const completed = new Date(proposal.completedAt).getTime();
-          completionTime = (completed - created) / (1000 * 60 * 60);
-        }
+        const completionTime =
+          proposal.completedAt && proposal.createdAt
+            ? (new Date(proposal.completedAt) -
+                new Date(proposal.createdAt)) /
+              (1000 * 60 * 60)
+            : null;
 
         return {
           id: proposal.id,
@@ -251,10 +247,12 @@ class AnalyticsService {
           createdAt: proposal.createdAt,
           completedAt: proposal.completedAt,
           status: proposal.status,
-          questionCount,
-          approvedAnswers,
-          aiGeneratedAnswers,
-          humanEditedAnswers,
+          questionCount: questions.length,
+          approvedAnswers: questions.filter(q => q.status === 'approved').length,
+          aiGeneratedAnswers: questions.filter(q => q.draftAnswer).length,
+          humanEditedAnswers: questions.filter(
+            q => q.finalAnswer && q.finalAnswer !== q.draftAnswer
+          ).length,
           completionTime,
           assignedTo: proposal.assignedTo,
         };
@@ -265,22 +263,19 @@ class AnalyticsService {
     }
   }
 
-  async exportAnalytics(companyId, format) {
+  async exportAnalytics(companyId) {
     try {
       const summary = await this.getCompanySummary(companyId);
-      const detailedProposals = await this.getDetailedProposalAnalytics(companyId);
-
-      const data = {
-        summary,
-        detailedProposals,
-        generatedAt: new Date().toISOString(),
-      };
-
-      const filename = nalytics--.;
+      const detailedProposals =
+        await this.getDetailedProposalAnalytics(companyId);
 
       return {
-        data,
-        filename,
+        data: {
+          summary,
+          detailedProposals,
+          generatedAt: new Date().toISOString(),
+        },
+        filename: `analytics-${companyId}-${Date.now()}.json`,
       };
     } catch (error) {
       logger.error('Error exporting analytics:', error);

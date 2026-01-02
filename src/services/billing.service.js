@@ -1,287 +1,154 @@
-﻿import { QueryCommand } from '@aws-sdk/lib-dynamodb';
+﻿import { PutCommand, GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { docClient, TABLES } from '../config/aws.config.js';
+import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../utils/logger.js';
 
-class AnalyticsService {
-  async getCompanySummary(companyId) {
-    try {
-      const [proposals, users, knowledge, aiStats] = await Promise.all([
-        this.getProposalStats(companyId),
-        this.getUserStats(companyId),
-        this.getKnowledgeStats(companyId),
-        this.getAIStats(companyId),
-      ]);
-
-      return {
-        proposals,
-        users,
-        knowledge,
-        ai: aiStats,
-        performance: {
-          averageResponseTime: 250, // ms (mock)
-          successRate: 98.5,        // %
-          apiCalls: 15420,
-        },
-      };
-    } catch (error) {
-      logger.error('Error getting company summary:', error);
-      throw error;
-    }
+class BillingService {
+  constructor() {
+    this.planPricing = {
+      free: 0,
+      starter: 49,
+      professional: 149,
+      enterprise: 499,
+    };
   }
 
-  async getProposalStats(companyId) {
+  async createInvoice(data) {
     try {
-      const command = new QueryCommand({
-        TableName: TABLES.PROPOSALS,
-        IndexName: 'CompanyIdIndex',
-        KeyConditionExpression: 'companyId = :companyId',
-        ExpressionAttributeValues: {
-          ':companyId': companyId,
+      const baseAmount = this.planPricing[data.planType] || 0;
+      
+      const lineItems = [
+        {
+          description: `${data.planType.charAt(0).toUpperCase() + data.planType.slice(1)} Plan`,
+          quantity: 1,
+          unitPrice: baseAmount,
+          amount: baseAmount,
         },
-      });
+      ];
 
-      const { Items = [] } = await docClient.send(command);
-
-      const byStatus = {};
-      const byMonth = {};
-      let totalCompletionTime = 0;
-      let completedCount = 0;
-
-      Items.forEach((proposal) => {
-        if (proposal.status) {
-          byStatus[proposal.status] = (byStatus[proposal.status] || 0) + 1;
-        }
-
-        if (proposal.createdAt) {
-          const month = proposal.createdAt.substring(0, 7);
-          byMonth[month] = (byMonth[month] || 0) + 1;
-        }
-
-        if (proposal.completedAt && proposal.createdAt) {
-          const created = new Date(proposal.createdAt).getTime();
-          const completed = new Date(proposal.completedAt).getTime();
-          totalCompletionTime += (completed - created) / (1000 * 60 * 60);
-          completedCount++;
-        }
-      });
-
-      const byMonthArray = Object.entries(byMonth)
-        .map(([month, count]) => ({ month, count }))
-        .sort((a, b) => a.month.localeCompare(b.month))
-        .slice(-12);
-
-      return {
-        total: Items.length,
-        byStatus,
-        byMonth: byMonthArray,
-        averageCompletionTime:
-          completedCount > 0 ? totalCompletionTime / completedCount : 0,
-      };
-    } catch (error) {
-      logger.error('Error getting proposal stats:', error);
-      throw error;
-    }
-  }
-
-  async getUserStats(companyId) {
-    try {
-      const command = new QueryCommand({
-        TableName: TABLES.USERS,
-        IndexName: 'CompanyIdIndex',
-        KeyConditionExpression: 'companyId = :companyId',
-        ExpressionAttributeValues: {
-          ':companyId': companyId,
-        },
-      });
-
-      const { Items = [] } = await docClient.send(command);
-
-      const byRole = {};
-      const byDepartment = {};
-      let active = 0;
-
-      Items.forEach((user) => {
-        if (user.role) {
-          byRole[user.role] = (byRole[user.role] || 0) + 1;
-        }
-
-        if (user.department) {
-          byDepartment[user.department] =
-            (byDepartment[user.department] || 0) + 1;
-        }
-
-        if (user.isActive) active++;
-      });
-
-      return {
-        total: Items.length,
-        active,
-        byRole,
-        byDepartment,
-      };
-    } catch (error) {
-      logger.error('Error getting user stats:', error);
-      throw error;
-    }
-  }
-
-  async getKnowledgeStats(companyId) {
-    try {
-      const command = new QueryCommand({
-        TableName: TABLES.KNOWLEDGE,
-        IndexName: 'CompanyIdIndex',
-        KeyConditionExpression: 'companyId = :companyId',
-        ExpressionAttributeValues: {
-          ':companyId': companyId,
-        },
-      });
-
-      const { Items = [] } = await docClient.send(command);
-
-      const byCategory = {};
-      let totalSize = 0;
-
-      Items.forEach((doc) => {
-        const category = doc.category || 'Uncategorized';
-        byCategory[category] = (byCategory[category] || 0) + 1;
-        totalSize += doc.size || 0;
-      });
-
-      return {
-        totalDocuments: Items.length,
-        byCategory,
-        totalSize,
-      };
-    } catch (error) {
-      logger.error('Error getting knowledge stats:', error);
-      throw error;
-    }
-  }
-
-  async getAIStats(companyId) {
-    try {
-      const command = new QueryCommand({
-        TableName: TABLES.PROPOSALS,
-        IndexName: 'CompanyIdIndex',
-        KeyConditionExpression: 'companyId = :companyId',
-        ExpressionAttributeValues: {
-          ':companyId': companyId,
-        },
-      });
-
-      const { Items = [] } = await docClient.send(command);
-
-      let totalGenerations = 0;
-      let totalConfidence = 0;
-      let confidenceCount = 0;
-      const categoryCount = {};
-
-      Items.forEach((proposal) => {
-        (proposal.questions || []).forEach((q) => {
-          if (q.draftAnswer) totalGenerations++;
-          if (typeof q.confidence === 'number') {
-            totalConfidence += q.confidence;
-            confidenceCount++;
-          }
-          if (q.category) {
-            categoryCount[q.category] =
-              (categoryCount[q.category] || 0) + 1;
-          }
+      if (data.additionalCharges) {
+        data.additionalCharges.forEach(charge => {
+          lineItems.push({
+            description: charge.description,
+            quantity: 1,
+            unitPrice: charge.amount,
+            amount: charge.amount,
+          });
         });
-      });
-
-      const topCategories = Object.entries(categoryCount)
-        .map(([category, count]) => ({ category, count }))
-        .sort((a, b) => b.count - a.count)
-        .slice(0, 10);
-
-      return {
-        totalGenerations,
-        averageConfidence:
-          confidenceCount > 0 ? totalConfidence / confidenceCount : 0,
-        topCategories,
-      };
-    } catch (error) {
-      logger.error('Error getting AI stats:', error);
-      throw error;
-    }
-  }
-
-  async getDetailedProposalAnalytics(companyId, filters = {}) {
-    try {
-      let filterExpression;
-      const values = { ':companyId': companyId };
-      const names = {};
-
-      if (filters.status) {
-        filterExpression = '#status = :status';
-        values[':status'] = filters.status;
-        names['#status'] = 'status';
       }
 
-      const command = new QueryCommand({
-        TableName: TABLES.PROPOSALS,
-        IndexName: 'CompanyIdIndex',
-        KeyConditionExpression: 'companyId = :companyId',
-        FilterExpression: filterExpression,
-        ExpressionAttributeNames: Object.keys(names).length ? names : undefined,
-        ExpressionAttributeValues: values,
+      const totalAmount = lineItems.reduce((sum, item) => sum + item.amount, 0);
+
+      const invoice = {
+        id: uuidv4(),
+        companyId: data.companyId,
+        invoiceNumber: this.generateInvoiceNumber(),
+        amount: totalAmount,
+        currency: 'USD',
+        status: 'pending',
+        billingPeriodStart: data.billingPeriodStart,
+        billingPeriodEnd: data.billingPeriodEnd,
+        dueDate: this.calculateDueDate(data.billingPeriodEnd),
+        lineItems,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      const command = new PutCommand({
+        TableName: TABLES.INVOICES,
+        Item: invoice,
       });
 
-      const { Items = [] } = await docClient.send(command);
+      await docClient.send(command);
+      logger.info(`Invoice created: ${invoice.id}`);
 
-      return Items.map((proposal) => {
-        const questions = proposal.questions || [];
-
-        const completionTime =
-          proposal.completedAt && proposal.createdAt
-            ? (new Date(proposal.completedAt) -
-                new Date(proposal.createdAt)) /
-              (1000 * 60 * 60)
-            : null;
-
-        return {
-          id: proposal.id,
-          title: proposal.title,
-          clientName: proposal.clientName,
-          createdAt: proposal.createdAt,
-          completedAt: proposal.completedAt,
-          status: proposal.status,
-          questionCount: questions.length,
-          approvedAnswers: questions.filter(q => q.status === 'approved').length,
-          aiGeneratedAnswers: questions.filter(q => q.draftAnswer).length,
-          humanEditedAnswers: questions.filter(
-            q => q.finalAnswer && q.finalAnswer !== q.draftAnswer
-          ).length,
-          completionTime,
-          assignedTo: proposal.assignedTo,
-        };
-      });
+      return invoice;
     } catch (error) {
-      logger.error('Error getting detailed proposal analytics:', error);
+      logger.error('Error creating invoice:', error);
       throw error;
     }
   }
 
-  async exportAnalytics(companyId) {
+  async getInvoice(id) {
     try {
-      const summary = await this.getCompanySummary(companyId);
-      const detailedProposals =
-        await this.getDetailedProposalAnalytics(companyId);
+      const command = new GetCommand({
+        TableName: TABLES.INVOICES,
+        Key: { id },
+      });
 
-      return {
-        data: {
-          summary,
-          detailedProposals,
-          generatedAt: new Date().toISOString(),
-        },
-        filename: `analytics-${companyId}-${Date.now()}.json`,
-      };
+      const response = await docClient.send(command);
+      return response.Item || null;
     } catch (error) {
-      logger.error('Error exporting analytics:', error);
+      logger.error('Error getting invoice:', error);
       throw error;
     }
+  }
+
+  async listCompanyInvoices(companyId, limit = 50) {
+    try {
+      const command = new QueryCommand({
+        TableName: TABLES.INVOICES,
+        IndexName: 'CompanyIdIndex',
+        KeyConditionExpression: 'companyId = :companyId',
+        ExpressionAttributeValues: {
+          ':companyId': companyId,
+        },
+        ScanIndexForward: false,
+        Limit: limit,
+      });
+
+      const response = await docClient.send(command);
+      return response.Items || [];
+    } catch (error) {
+      logger.error('Error listing company invoices:', error);
+      throw error;
+    }
+  }
+
+  async markInvoiceAsPaid(invoiceId, paymentMethod) {
+    try {
+      const command = new UpdateCommand({
+        TableName: TABLES.INVOICES,
+        Key: { id: invoiceId },
+        UpdateExpression: 'SET #status = :status, #paidDate = :paidDate, #paymentMethod = :paymentMethod, #updatedAt = :updatedAt',
+        ExpressionAttributeNames: {
+          '#status': 'status',
+          '#paidDate': 'paidDate',
+          '#paymentMethod': 'paymentMethod',
+          '#updatedAt': 'updatedAt',
+        },
+        ExpressionAttributeValues: {
+          ':status': 'paid',
+          ':paidDate': new Date().toISOString(),
+          ':paymentMethod': paymentMethod,
+          ':updatedAt': new Date().toISOString(),
+        },
+        ReturnValues: 'ALL_NEW',
+      });
+
+      const response = await docClient.send(command);
+      logger.info(`Invoice marked as paid: ${invoiceId}`);
+
+      return response.Attributes;
+    } catch (error) {
+      logger.error('Error marking invoice as paid:', error);
+      throw error;
+    }
+  }
+
+  generateInvoiceNumber() {
+    const date = new Date();
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+    return `INV-${year}${month}-${random}`;
+  }
+
+  calculateDueDate(billingPeriodEnd) {
+    const endDate = new Date(billingPeriodEnd);
+    endDate.setDate(endDate.getDate() + 15);
+    return endDate.toISOString();
   }
 }
 
-export const analyticsService = new AnalyticsService();
+export const billingService = new BillingService();

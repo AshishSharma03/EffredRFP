@@ -1,233 +1,173 @@
-import {
-  PutCommand,
-  GetCommand,
-  UpdateCommand,
-  DeleteCommand,
-  QueryCommand,
-} from '@aws-sdk/lib-dynamodb';
-import { docClient, TABLES } from '../config/aws.config.js';
-import { v4 as uuidv4 } from 'uuid';
-import bcrypt from 'bcryptjs';
+import { openSearchClient } from '../config/aws.config.js';
 import { logger } from '../utils/logger.js';
 
-class UserService {
-  async createUser(data) {
+class SearchService {
+  constructor() {
+    this.indexName = process.env.OPENSEARCH_INDEX || 'knowledge-base';
+  }
+
+  async createIndex() {
     try {
-      const existingUser = await this.getUserByEmail(data.email);
-      if (existingUser) {
-        throw new Error('User with this email already exists');
+      const indexExists = await openSearchClient.indices.exists({
+        index: this.indexName,
+      });
+
+      if (!indexExists.body) {
+        await openSearchClient.indices.create({
+          index: this.indexName,
+          body: {
+            settings: {
+              number_of_shards: 1,
+              number_of_replicas: 1,
+              analysis: {
+                analyzer: {
+                  custom_analyzer: {
+                    type: 'custom',
+                    tokenizer: 'standard',
+                    filter: ['lowercase', 'stop', 'snowball'],
+                  },
+                },
+              },
+            },
+            mappings: {
+              properties: {
+                title: { type: 'text', analyzer: 'custom_analyzer' },
+                content: { type: 'text', analyzer: 'custom_analyzer' },
+                category: { type: 'keyword' },
+                tags: { type: 'keyword' },
+                createdAt: { type: 'date' },
+                updatedAt: { type: 'date' },
+              },
+            },
+          },
+        });
+
+        logger.info(`Index created: ${this.indexName}`);
+      }
+    } catch (error) {
+      logger.error('Error creating index:', error);
+      throw error;
+    }
+  }
+
+  async indexDocument(document) {
+    try {
+      await openSearchClient.index({
+        index: this.indexName,
+        id: document.id,
+        body: document,
+        refresh: true,
+      });
+
+      logger.info(`Document indexed: ${document.id}`);
+    } catch (error) {
+      logger.error('Error indexing document:', error);
+      throw error;
+    }
+  }
+
+  async searchDocuments(query, filters = {}, size = 10) {
+    try {
+      const must = [
+        {
+          multi_match: {
+            query: query,
+            fields: ['title^3', 'content'],
+            type: 'best_fields',
+            operator: 'or',
+            fuzziness: 'AUTO',
+          },
+        },
+      ];
+
+      if (filters.category) {
+        must.push({ term: { category: filters.category } });
       }
 
-      const hashedPassword = await bcrypt.hash(data.password, 10);
+      if (filters.tags && filters.tags.length > 0) {
+        must.push({ terms: { tags: filters.tags } });
+      }
 
-      const user = {
-        id: uuidv4(),
-        email: data.email,
-        name: data.name,
-        password: hashedPassword,
-        role: data.role,
-        companyId: data.companyId,
-        department: data.department,
-        jobTitle: data.jobTitle,
-        phone: data.phone,
-        isActive: true,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        createdBy: data.createdBy,
-      };
-
-      const command = new PutCommand({
-        TableName: TABLES.USERS,
-        Item: user,
-      });
-
-      await docClient.send(command);
-      logger.info(`User created: ${user.id}`);
-
-      const { password, ...userWithoutPassword } = user;
-      return userWithoutPassword;
-    } catch (error) {
-      logger.error('Error creating user:', error);
-      throw error;
-    }
-  }
-
-  async getUserByEmail(email) {
-    try {
-      const command = new GetCommand({
-        TableName: TABLES.USERS,
-        Key: { email },
-      });
-
-      const response = await docClient.send(command);
-      return response.Item || null;
-    } catch (error) {
-      logger.error('Error getting user by email:', error);
-      throw error;
-    }
-  }
-
-  async getUserById(id) {
-    try {
-      const command = new QueryCommand({
-        TableName: TABLES.USERS,
-        IndexName: 'UserIdIndex',
-        KeyConditionExpression: 'id = :id',
-        ExpressionAttributeValues: {
-          ':id': id,
+      const response = await openSearchClient.search({
+        index: this.indexName,
+        body: {
+          query: { bool: { must } },
+          highlight: {
+            fields: {
+              content: {
+                fragment_size: 150,
+                number_of_fragments: 3,
+              },
+            },
+          },
+          size,
         },
       });
 
-      const response = await docClient.send(command);
-      return response.Items?.[0] || null;
+      const results = response.body.hits.hits.map((hit) => ({
+        id: hit._id,
+        title: hit._source.title,
+        content: hit._source.content,
+        score: hit._score,
+        highlights: hit.highlight?.content || [],
+      }));
+
+      logger.info(`Search completed: ${results.length} results found`);
+      return results;
     } catch (error) {
-      logger.error('Error getting user by ID:', error);
+      logger.error('Error searching documents:', error);
       throw error;
     }
   }
 
-  async listCompanyUsers(companyId) {
+  async searchRelevantContext(question, topK = 5) {
     try {
-      const command = new QueryCommand({
-        TableName: TABLES.USERS,
-        IndexName: 'CompanyIdIndex',
-        KeyConditionExpression: 'companyId = :companyId',
-        ExpressionAttributeValues: {
-          ':companyId': companyId,
+      const results = await this.searchDocuments(question, {}, topK);
+      return results.map(r => {
+        const highlights = r.highlights?.join('... ') || '';
+        return `Title: ${r.title}\nContent: ${highlights || r.content.substring(0, 500)}`;
+      });
+    } catch (error) {
+      logger.error('Error searching relevant context:', error);
+      throw error;
+    }
+  }
+
+  async deleteDocument(id) {
+    try {
+      await openSearchClient.delete({
+        index: this.indexName,
+        id,
+        refresh: true,
+      });
+
+      logger.info(`Document deleted: ${id}`);
+    } catch (error) {
+      logger.error('Error deleting document:', error);
+      throw error;
+    }
+  }
+
+  async updateDocument(id, updates) {
+    try {
+      await openSearchClient.update({
+        index: this.indexName,
+        id,
+        body: {
+          doc: {
+            ...updates,
+            updatedAt: new Date().toISOString(),
+          },
         },
+        refresh: true,
       });
 
-      const response = await docClient.send(command);
-      const users = response.Items || [];
-
-      return users.map(({ password, ...user }) => user);
+      logger.info(`Document updated: ${id}`);
     } catch (error) {
-      logger.error('Error listing company users:', error);
+      logger.error('Error updating document:', error);
       throw error;
     }
-  }
-
-  async updateUser(email, updates) {
-    try {
-      const updateExpressions = [];
-      const expressionAttributeNames = {};
-      const expressionAttributeValues = {};
-
-      if (updates.password) {
-        updates.password = await bcrypt.hash(updates.password, 10);
-      }
-
-      Object.entries(updates).forEach(([key, value], index) => {
-        if (key !== 'email' && key !== 'createdAt') {
-          updateExpressions.push(`#attr${index} = :val${index}`);
-          expressionAttributeNames[`#attr${index}`] = key;
-          expressionAttributeValues[`:val${index}`] = value;
-        }
-      });
-
-      updateExpressions.push('#updatedAt = :updatedAt');
-      expressionAttributeNames['#updatedAt'] = 'updatedAt';
-      expressionAttributeValues[':updatedAt'] = new Date().toISOString();
-
-      const command = new UpdateCommand({
-        TableName: TABLES.USERS,
-        Key: { email },
-        UpdateExpression: `SET ${updateExpressions.join(', ')}`,
-        ExpressionAttributeNames: expressionAttributeNames,
-        ExpressionAttributeValues: expressionAttributeValues,
-        ReturnValues: 'ALL_NEW',
-      });
-
-      const response = await docClient.send(command);
-      logger.info(`User updated: ${email}`);
-
-      const { password, ...userWithoutPassword } = response.Attributes;
-      return userWithoutPassword;
-    } catch (error) {
-      logger.error('Error updating user:', error);
-      throw error;
-    }
-  }
-
-  async deleteUser(email) {
-    try {
-      const command = new DeleteCommand({
-        TableName: TABLES.USERS,
-        Key: { email },
-      });
-
-      await docClient.send(command);
-      logger.info(`User deleted: ${email}`);
-    } catch (error) {
-      logger.error('Error deleting user:', error);
-      throw error;
-    }
-  }
-
-  async deactivateUser(email) {
-    try {
-      await this.updateUser(email, { isActive: false });
-      logger.info(`User deactivated: ${email}`);
-    } catch (error) {
-      logger.error('Error deactivating user:', error);
-      throw error;
-    }
-  }
-
-  async activateUser(email) {
-    try {
-      await this.updateUser(email, { isActive: true });
-      logger.info(`User activated: ${email}`);
-    } catch (error) {
-      logger.error('Error activating user:', error);
-      throw error;
-    }
-  }
-
-  async validateCredentials(email, password) {
-    try {
-      const user = await this.getUserByEmail(email);
-      if (!user || !user.isActive) {
-        return null;
-      }
-
-      const isValid = await bcrypt.compare(password, user.password);
-      return isValid ? user : null;
-    } catch (error) {
-      logger.error('Error validating credentials:', error);
-      throw error;
-    }
-  }
-
-  async bulkCreateUsers(users, companyId, createdBy) {
-    const successful = [];
-    const failed = [];
-
-    const defaultPassword = 'ChangeMe@123';
-
-    for (const userData of users) {
-      try {
-        const user = await this.createUser({
-          ...userData,
-          password: defaultPassword,
-          companyId,
-          createdBy,
-        });
-        successful.push(user);
-      } catch (error) {
-        failed.push({
-          email: userData.email,
-          error: error instanceof Error ? error.message : 'Unknown error',
-        });
-      }
-    }
-
-    logger.info(
-      `Bulk user creation: ${successful.length} successful, ${failed.length} failed`
-    );
-
-    return { successful, failed };
   }
 }
 
-export const userService = new UserService();
+export const searchService = new SearchService();

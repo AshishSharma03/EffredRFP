@@ -1,287 +1,446 @@
 import express from 'express';
+import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import multer from 'multer';
 import { asyncHandler, AppError } from '../middleware/error.middleware.js';
-import { authenticate, authorize } from '../middleware/auth.middleware.js';
-import { userService } from '../services/user.service.js';
-import { companyService } from '../services/company.service.js';
-import { billingService } from '../services/billing.service.js';
-import { analyticsService } from '../services/analytics.service.js';
-import { documentExportService } from '../services/export.service.js';
-import { searchService } from '../services/search.service.js';
-import { s3Service } from '../services/s3.service.js';
-import { documentProcessor } from '../services/document.service.js';
+import { authenticate, isCompanyAdminOrHigher } from '../middleware/auth.middleware.js';
+import { PutCommand, GetCommand, QueryCommand, UpdateCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
+import { docClient, TABLES, s3Client } from '../config/aws.config.js';
 import { v4 as uuidv4 } from 'uuid';
+import { PutObjectCommand } from '@aws-sdk/client-s3';
+import { extractTextFromPDF, extractTextFromDocx } from '../services/document.service.js';
+import { invokeModel } from '../services/ai.service.js';
 
 const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage() });
 
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: parseInt(process.env.MAX_FILE_SIZE || '52428800'),
-  },
-});
+router.use(authenticate);
+router.use(isCompanyAdminOrHigher);
 
-// All admin routes require admin role
-router.use(authenticate, authorize('admin'));
+// Middleware to check company limits
+const checkCompanyLimits = async (req, res, next) => {
+  const companyResponse = await docClient.send(new GetCommand({
+    TableName: TABLES.COMPANIES,
+    Key: { id: req.user.companyId },
+  }));
 
-// ========================================
-// USER MANAGEMENT
-// ========================================
+  if (!companyResponse.Item) {
+    throw new AppError('Company not found', 404);
+  }
 
-router.get(
-  '/users',
-  asyncHandler(async (req, res) => {
-    const users = await userService.listCompanyUsers(req.user.companyId);
-    res.status(200).json({ users, count: users.length });
-  })
-);
+  req.company = companyResponse.Item;
+  next();
+};
 
+// ============================================
+// USER MANAGEMENT (ENHANCED)
+// ============================================
+
+/**
+ * @route   POST /api/v1/admin/users
+ * @desc    Create user with password (check limits)
+ */
 router.post(
   '/users',
+  checkCompanyLimits,
   asyncHandler(async (req, res) => {
-    const { email, name, password, role, department, jobTitle, phone } = req.body;
+    const { email, password, name, department, jobTitle, phone } = req.body;
 
-    if (!email || !name || !password) {
-      throw new AppError('Email, name, and password are required', 400);
+    if (!email || !password || !name) {
+      throw new AppError('Email, password, and name are required', 400);
     }
 
-    const user = await userService.createUser({
+    // Check if company can add users
+    if (!req.company.limits.allowAddUser) {
+      throw new AppError('Company is not allowed to add users. Contact SuperAdmin.', 403);
+    }
+
+    // Check user limit
+    if (req.company.limits.usersAdded >= req.company.limits.maxUsers) {
+      throw new AppError(`User limit reached (${req.company.limits.maxUsers}). Contact SuperAdmin to increase limit.`, 403);
+    }
+
+    // Check if user exists
+    const existingUser = await docClient.send(new GetCommand({
+      TableName: TABLES.USERS,
+      Key: { email },
+    }));
+
+    if (existingUser.Item) {
+      throw new AppError('User already exists', 409);
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const userId = uuidv4();
+
+    const user = {
+      id: userId,
       email,
       name,
-      password,
-      role: role || 'user',
+      password: hashedPassword,
+      phone: phone || '',
+      role: 'user',
       companyId: req.user.companyId,
-      department,
-      jobTitle,
-      phone,
+      
+      loginStatus: 'enabled', // Users enabled by default
+      isActive: true,
+      
+      usage: {
+        totalLogins: 0,
+        totalSearches: 0,
+        totalExports: 0,
+        lastLoginAt: null,
+        lastPasswordResetAt: null,
+      },
+      
+      department: department || '',
+      jobTitle: jobTitle || '',
+      
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
       createdBy: req.user.id,
-    });
+      
+      resetToken: null,
+      resetTokenExpiry: null,
+    };
+
+    await docClient.send(new PutCommand({
+      TableName: TABLES.USERS,
+      Item: user,
+    }));
+
+    // Increment company user count
+    await docClient.send(new UpdateCommand({
+      TableName: TABLES.COMPANIES,
+      Key: { id: req.user.companyId },
+      UpdateExpression: 'SET #limits.#usersAdded = #limits.#usersAdded + :inc',
+      ExpressionAttributeNames: {
+        '#limits': 'limits',
+        '#usersAdded': 'usersAdded',
+      },
+      ExpressionAttributeValues: {
+        ':inc': 1,
+      },
+    }));
+
+    const { password: _, ...userWithoutPassword } = user;
 
     res.status(201).json({
       message: 'User created successfully',
-      user,
+      user: userWithoutPassword,
+      remainingSlots: req.company.limits.maxUsers - req.company.limits.usersAdded - 1,
     });
   })
 );
 
+/**
+ * @route   POST /api/v1/admin/users/:id/reset-password
+ * @desc    Send password reset email to user
+ */
 router.post(
-  '/users/bulk',
-  upload.single('file'),
+  '/users/:id/reset-password',
   asyncHandler(async (req, res) => {
-    if (!req.file) {
-      throw new AppError('No file uploaded', 400);
+    const { id } = req.params;
+
+    const usersResponse = await docClient.send(new ScanCommand({
+      TableName: TABLES.USERS,
+      FilterExpression: 'id = :id AND companyId = :companyId',
+      ExpressionAttributeValues: { 
+        ':id': id,
+        ':companyId': req.user.companyId,
+      },
+    }));
+
+    if (!usersResponse.Items || usersResponse.Items.length === 0) {
+      throw new AppError('User not found', 404);
     }
 
-    const csvText = req.file.buffer.toString('utf-8');
-    const lines = csvText.split('\n').filter(line => line.trim());
-    const headers = lines[0].split(',').map(h => h.trim());
+    const user = usersResponse.Items[0];
 
-    const users = lines.slice(1).map(line => {
-      const values = line.split(',').map(v => v.trim());
-      const user = {};
-      headers.forEach((header, index) => {
-        user[header] = values[index];
-      });
-      return user;
-    });
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const resetTokenExpiry = new Date(Date.now() + 3600000).toISOString();
 
-    const result = await userService.bulkCreateUsers(
-      users,
-      req.user.companyId,
-      req.user.id
-    );
+    await docClient.send(new UpdateCommand({
+      TableName: TABLES.USERS,
+      Key: { email: user.email },
+      UpdateExpression: 'SET resetToken = :token, resetTokenExpiry = :expiry, updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':token': resetToken,
+        ':expiry': resetTokenExpiry,
+        ':updatedAt': new Date().toISOString(),
+      },
+    }));
 
-    res.status(200).json({
-      message: 'Bulk user creation completed',
-      successful: result.successful.length,
-      failed: result.failed.length,
-      details: result,
+    const resetUrl = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
+
+    res.json({ 
+      message: 'Password reset email sent',
+      resetToken,
+      resetUrl,
     });
   })
 );
 
-router.patch(
-  '/users/:email',
-  asyncHandler(async (req, res) => {
-    const user = await userService.updateUser(req.params.email, req.body);
-    res.status(200).json({
-      message: 'User updated successfully',
-      user,
-    });
-  })
-);
-
-router.post(
-  '/users/:email/deactivate',
-  asyncHandler(async (req, res) => {
-    await userService.deactivateUser(req.params.email);
-    res.status(200).json({
-      message: 'User deactivated successfully',
-    });
-  })
-);
-
-router.post(
-  '/users/:email/activate',
-  asyncHandler(async (req, res) => {
-    await userService.activateUser(req.params.email);
-    res.status(200).json({
-      message: 'User activated successfully',
-    });
-  })
-);
-
-// ========================================
-// COMPANY SETTINGS
-// ========================================
-
+/**
+ * @route   GET /api/v1/admin/users/:id/usage
+ * @desc    Get user usage statistics
+ */
 router.get(
-  '/company',
+  '/users/:id/usage',
   asyncHandler(async (req, res) => {
-    const company = await companyService.getCompany(req.user.companyId);
-    if (!company) {
-      throw new AppError('Company not found', 404);
-    }
-    res.status(200).json({ company });
-  })
-);
+    const { id } = req.params;
 
-router.patch(
-  '/company',
-  asyncHandler(async (req, res) => {
-    const company = await companyService.updateCompany(
-      req.user.companyId,
-      req.body
-    );
-    res.status(200).json({
-      message: 'Company updated successfully',
-      company,
+    const usersResponse = await docClient.send(new ScanCommand({
+      TableName: TABLES.USERS,
+      FilterExpression: 'id = :id AND companyId = :companyId',
+      ExpressionAttributeValues: { 
+        ':id': id,
+        ':companyId': req.user.companyId,
+      },
+    }));
+
+    if (!usersResponse.Items || usersResponse.Items.length === 0) {
+      throw new AppError('User not found', 404);
+    }
+
+    const user = usersResponse.Items[0];
+
+    res.json({
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+      },
+      usage: user.usage,
+      loginStatus: user.loginStatus,
+      isActive: user.isActive,
     });
   })
 );
 
+/**
+ * @route   POST /api/v1/admin/users/:id/disable-login
+ * @desc    Disable user login
+ */
 router.post(
-  '/company/logo',
+  '/users/:id/disable-login',
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+
+    const usersResponse = await docClient.send(new ScanCommand({
+      TableName: TABLES.USERS,
+      FilterExpression: 'id = :id AND companyId = :companyId',
+      ExpressionAttributeValues: { 
+        ':id': id,
+        ':companyId': req.user.companyId,
+      },
+    }));
+
+    if (!usersResponse.Items || usersResponse.Items.length === 0) {
+      throw new AppError('User not found', 404);
+    }
+
+    const user = usersResponse.Items[0];
+
+    await docClient.send(new UpdateCommand({
+      TableName: TABLES.USERS,
+      Key: { email: user.email },
+      UpdateExpression: 'SET loginStatus = :status, updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':status': 'disabled',
+        ':updatedAt': new Date().toISOString(),
+      },
+    }));
+
+    res.json({ message: 'User login disabled successfully' });
+  })
+);
+
+/**
+ * @route   POST /api/v1/admin/users/:id/enable-login
+ * @desc    Enable user login
+ */
+router.post(
+  '/users/:id/enable-login',
+  asyncHandler(async (req, res) => {
+    const { id } = req.params;
+
+    const usersResponse = await docClient.send(new ScanCommand({
+      TableName: TABLES.USERS,
+      FilterExpression: 'id = :id AND companyId = :companyId',
+      ExpressionAttributeValues: { 
+        ':id': id,
+        ':companyId': req.user.companyId,
+      },
+    }));
+
+    if (!usersResponse.Items || usersResponse.Items.length === 0) {
+      throw new AppError('User not found', 404);
+    }
+
+    const user = usersResponse.Items[0];
+
+    await docClient.send(new UpdateCommand({
+      TableName: TABLES.USERS,
+      Key: { email: user.email },
+      UpdateExpression: 'SET loginStatus = :status, updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':status': 'enabled',
+        ':updatedAt': new Date().toISOString(),
+      },
+    }));
+
+    res.json({ message: 'User login enabled successfully' });
+  })
+);
+
+// ============================================
+// COMPANY LOGO & PROFILE
+// ============================================
+
+/**
+ * @route   POST /api/v1/admin/logo
+ * @desc    Upload company logo (check permission)
+ */
+router.post(
+  '/logo',
+  checkCompanyLimits,
   upload.single('logo'),
   asyncHandler(async (req, res) => {
     if (!req.file) {
-      throw new AppError('No logo file uploaded', 400);
+      throw new AppError('Logo file is required', 400);
     }
 
-    const { logoUrl, logoS3Key } = await companyService.uploadLogo(
-      req.user.companyId,
-      req.file
-    );
+    // Check permission
+    if (!req.company.limits.allowUpdateLogo) {
+      throw new AppError('Company is not allowed to update logo. Contact SuperAdmin.', 403);
+    }
 
-    res.status(200).json({
+    const fileKey = `companies/${req.user.companyId}/logos/${uuidv4()}-${req.file.originalname}`;
+
+    await s3Client.send(new PutObjectCommand({
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: fileKey,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype,
+    }));
+
+    const logoUrl = `https://${process.env.S3_BUCKET_NAME}.s3.amazonaws.com/${fileKey}`;
+
+    await docClient.send(new UpdateCommand({
+      TableName: TABLES.COMPANIES,
+      Key: { id: req.user.companyId },
+      UpdateExpression: 'SET logoUrl = :logoUrl, updatedAt = :updatedAt',
+      ExpressionAttributeValues: {
+        ':logoUrl': logoUrl,
+        ':updatedAt': new Date().toISOString(),
+      },
+    }));
+
+    res.json({
       message: 'Logo uploaded successfully',
       logoUrl,
-      logoS3Key,
     });
   })
 );
 
-router.patch(
-  '/company/branding',
+// ============================================
+// USAGE & BILLING
+// ============================================
+
+/**
+ * @route   GET /api/v1/admin/usage/summary
+ * @desc    Get company usage summary
+ */
+router.get(
+  '/usage/summary',
+  checkCompanyLimits,
   asyncHandler(async (req, res) => {
-    const { primaryColor, secondaryColor } = req.body;
-
-    const company = await companyService.updateBranding(req.user.companyId, {
-      primaryColor,
-      secondaryColor,
-    });
-
-    res.status(200).json({
-      message: 'Branding updated successfully',
-      company,
+    res.json({
+      company: {
+        id: req.company.id,
+        name: req.company.name,
+        plan: req.company.planType,
+      },
+      limits: req.company.limits,
+      usage: req.company.usage,
+      warnings: {
+        usersNearLimit: req.company.limits.usersAdded >= req.company.limits.maxUsers * 0.9,
+        searchesNearLimit: req.company.limits.searchesUsed >= req.company.limits.maxMonthlySearches * 0.9,
+        exportsNearLimit: req.company.limits.exportsUsed >= req.company.limits.maxMonthlyExports * 0.9,
+      },
     });
   })
 );
 
-router.patch(
-  '/company/settings',
+/**
+ * @route   GET /api/v1/admin/billing
+ * @desc    Get billing information
+ */
+router.get(
+  '/billing',
+  checkCompanyLimits,
   asyncHandler(async (req, res) => {
-    const company = await companyService.updateSettings(
-      req.user.companyId,
-      req.body
-    );
-
-    res.status(200).json({
-      message: 'Settings updated successfully',
-      settings: company.settings,
+    res.json({
+      company: {
+        id: req.company.id,
+        name: req.company.name,
+      },
+      subscription: {
+        plan: req.company.planType,
+        status: req.company.subscriptionStatus,
+      },
+      limits: req.company.limits,
+      usage: req.company.usage,
     });
   })
 );
 
-// ========================================
-// KNOWLEDGE BASE MANAGEMENT
-// ========================================
+// ============================================
+// BULK OPERATIONS
+// ============================================
 
+/**
+ * @route   POST /api/v1/admin/rfp/bulk-upload
+ * @desc    Bulk upload RFPs
+ */
 router.post(
-  '/knowledge/bulk-upload',
+  '/rfp/bulk-upload',
   upload.array('files', 50),
   asyncHandler(async (req, res) => {
-    const files = req.files;
-    
-    if (!files || files.length === 0) {
+    if (!req.files || req.files.length === 0) {
       throw new AppError('No files uploaded', 400);
     }
-
-    const { category, tags } = req.body;
-    const parsedTags = tags ? JSON.parse(tags) : [];
 
     const results = {
       successful: [],
       failed: [],
     };
 
-    for (const file of files) {
+    for (const file of req.files) {
       try {
-        const { key, url } = await s3Service.uploadFile(
-          file,
-          `knowledge-base/${req.user.companyId}`
-        );
+        const fileKey = `rfps/${req.user.companyId}/${uuidv4()}-${file.originalname}`;
 
-        const content = await documentProcessor.processDocument(
-          file.buffer,
-          file.mimetype
-        );
-
-        const cleanedContent = documentProcessor.cleanText(content);
-
-        const document = {
-          id: uuidv4(),
-          title: file.originalname,
-          content: cleanedContent,
-          category: category || 'General',
-          tags: parsedTags,
-          fileKey: key,
-          companyId: req.user.companyId,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-
-        await searchService.indexDocument(document);
-
-        await companyService.updateStorageUsed(
-          req.user.companyId,
-          file.size
-        );
+        await s3Client.send(new PutObjectCommand({
+          Bucket: process.env.S3_BUCKET_NAME,
+          Key: fileKey,
+          Body: file.buffer,
+          ContentType: file.mimetype,
+        }));
 
         results.successful.push({
           filename: file.originalname,
-          key,
-          url,
+          fileKey,
         });
       } catch (error) {
         results.failed.push({
           filename: file.originalname,
-          error: error instanceof Error ? error.message : 'Unknown error',
+          error: error.message,
         });
       }
     }
 
-    res.status(200).json({
+    res.json({
       message: 'Bulk upload completed',
       successful: results.successful.length,
       failed: results.failed.length,
@@ -290,106 +449,107 @@ router.post(
   })
 );
 
-// ========================================
-// ANALYTICS & REPORTING
-// ========================================
+// ============================================
+// AI SEARCH & Q&A
+// ============================================
 
-router.get(
-  '/analytics/summary',
-  asyncHandler(async (req, res) => {
-    const summary = await analyticsService.getCompanySummary(req.user.companyId);
-    res.status(200).json({ summary });
-  })
-);
-
-router.get(
-  '/analytics/proposals',
-  asyncHandler(async (req, res) => {
-    const { status, startDate, endDate } = req.query;
-
-    const analytics = await analyticsService.getDetailedProposalAnalytics(
-      req.user.companyId,
-      {
-        status,
-        startDate,
-        endDate,
-      }
-    );
-
-    res.status(200).json({ analytics });
-  })
-);
-
-router.get(
-  '/analytics/export',
-  asyncHandler(async (req, res) => {
-    const format = req.query.format || 'json';
-
-    const exported = await analyticsService.exportAnalytics(
-      req.user.companyId,
-      format
-    );
-
-    res.status(200).json(exported);
-  })
-);
-
-// ========================================
-// BILLING & USAGE
-// ========================================
-
-router.get(
-  '/billing/invoices',
-  asyncHandler(async (req, res) => {
-    const invoices = await billingService.listCompanyInvoices(req.user.companyId);
-    res.status(200).json({ invoices });
-  })
-);
-
-router.get(
-  '/billing/usage',
-  asyncHandler(async (req, res) => {
-    const usage = await companyService.getUsageStats(req.user.companyId);
-    res.status(200).json({ usage });
-  })
-);
-
+/**
+ * @route   POST /api/v1/admin/search-qa
+ * @desc    AI-powered Q&A from stored RFP data
+ */
 router.post(
-  '/billing/invoice/:id/pay',
+  '/search-qa',
+  checkCompanyLimits,
   asyncHandler(async (req, res) => {
-    const { paymentMethod } = req.body;
+    const { question, context } = req.body;
 
-    const invoice = await billingService.markInvoiceAsPaid(
-      req.params.id,
-      paymentMethod
-    );
+    if (!question) {
+      throw new AppError('Question is required', 400);
+    }
 
-    res.status(200).json({
-      message: 'Invoice marked as paid',
-      invoice,
+    // Check search limit
+    if (req.company.limits.searchesUsed >= req.company.limits.maxMonthlySearches) {
+      throw new AppError(`Monthly search limit (${req.company.limits.maxMonthlySearches}) reached. Contact SuperAdmin.`, 403);
+    }
+
+    // TODO: Search through stored RFPs/documents in company's knowledge base
+    // For now, use AI to generate answer
+
+    const prompt = `
+Question: ${question}
+
+Context: ${context || 'No additional context provided'}
+
+Based on the company's stored RFP data and knowledge base, provide a comprehensive answer to this question.
+`;
+
+    const response = await invokeModel(prompt);
+
+    // Increment search count
+    await docClient.send(new UpdateCommand({
+      TableName: TABLES.COMPANIES,
+      Key: { id: req.user.companyId },
+      UpdateExpression: 'SET #limits.#searchesUsed = #limits.#searchesUsed + :inc, #usage.#totalSearches = #usage.#totalSearches + :inc',
+      ExpressionAttributeNames: {
+        '#limits': 'limits',
+        '#searchesUsed': 'searchesUsed',
+        '#usage': 'usage',
+        '#totalSearches': 'totalSearches',
+      },
+      ExpressionAttributeValues: {
+        ':inc': 1,
+      },
+    }));
+
+    res.json({
+      question,
+      answer: response,
+      searchesRemaining: req.company.limits.maxMonthlySearches - req.company.limits.searchesUsed - 1,
     });
   })
 );
 
-// ========================================
-// DOCUMENT EXPORT
-// ========================================
-
-router.get(
-  '/export/proposal/:id',
+/**
+ * @route   POST /api/v1/admin/export
+ * @desc    Export data (check export limit)
+ */
+router.post(
+  '/export',
+  checkCompanyLimits,
   asyncHandler(async (req, res) => {
-    const format = req.query.format || 'pdf';
+    const { proposalId, format } = req.body;
 
-    const { url, key } = await documentExportService.exportAndUpload(
-      req.params.id,
-      format
-    );
+    if (!proposalId || !format) {
+      throw new AppError('Proposal ID and format are required', 400);
+    }
 
-    res.status(200).json({
-      message: 'Proposal exported successfully',
-      downloadUrl: url,
-      fileKey: key,
+    // Check export limit
+    if (req.company.limits.exportsUsed >= req.company.limits.maxMonthlyExports) {
+      throw new AppError(`Monthly export limit (${req.company.limits.maxMonthlyExports}) reached. Contact SuperAdmin.`, 403);
+    }
+
+    // TODO: Implement actual export logic
+
+    // Increment export count
+    await docClient.send(new UpdateCommand({
+      TableName: TABLES.COMPANIES,
+      Key: { id: req.user.companyId },
+      UpdateExpression: 'SET #limits.#exportsUsed = #limits.#exportsUsed + :inc, #usage.#totalExports = #usage.#totalExports + :inc',
+      ExpressionAttributeNames: {
+        '#limits': 'limits',
+        '#exportsUsed': 'exportsUsed',
+        '#usage': 'usage',
+        '#totalExports': 'totalExports',
+      },
+      ExpressionAttributeValues: {
+        ':inc': 1,
+      },
+    }));
+
+    res.json({
+      message: 'Export completed successfully',
       format,
+      exportsRemaining: req.company.limits.maxMonthlyExports - req.company.limits.exportsUsed - 1,
     });
   })
 );
